@@ -15,6 +15,7 @@ var (
 	tendermint bool
 	blocks     uint64
 	versions   uint64
+	app        string
 	appName    = "cosmprund"
 )
 
@@ -65,8 +66,15 @@ func NewRootCmd() *cobra.Command {
 		panic(err)
 	}
 
+	// --app flag
+	rootCmd.PersistentFlags().StringVar(&app, "app", "", "set the app you are pruning (supported apps: osmosis)")
+	if err := viper.BindPFlag("app", rootCmd.PersistentFlags().Lookup("app")); err != nil {
+		panic(err)
+	}
+
 	rootCmd.AddCommand(
 		pruneCmd(),
+		checkCmd(),
 	)
 
 	return rootCmd

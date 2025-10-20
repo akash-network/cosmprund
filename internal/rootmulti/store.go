@@ -12,23 +12,23 @@ import (
 	"sync"
 
 	iavltree "github.com/cosmos/iavl"
-	protoio "github.com/gogo/protobuf/io"
-	gogotypes "github.com/gogo/protobuf/types"
+	protoio "github.com/cosmos/gogoproto/io"
+	gogotypes "github.com/cosmos/gogoproto/types"
 	"github.com/pkg/errors"
-	abci "github.com/tendermint/tendermint/abci/types"
-	dbm "github.com/tendermint/tm-db"
-
-	"github.com/cosmos/cosmos-sdk/snapshots"
-	snapshottypes "github.com/cosmos/cosmos-sdk/snapshots/types"
-	"github.com/cosmos/cosmos-sdk/store/cachemulti"
-	"github.com/cosmos/cosmos-sdk/store/dbadapter"
-	"github.com/cosmos/cosmos-sdk/store/iavl"
-	"github.com/cosmos/cosmos-sdk/store/listenkv"
-	"github.com/cosmos/cosmos-sdk/store/mem"
-	"github.com/cosmos/cosmos-sdk/store/tracekv"
-	"github.com/cosmos/cosmos-sdk/store/transient"
-	"github.com/cosmos/cosmos-sdk/store/types"
-	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	dbm "github.com/cosmos/cosmos-db"
+	
+	"cosmossdk.io/log"
+	"cosmossdk.io/store/metrics"
+	"cosmossdk.io/store/snapshots"
+	snapshottypes "cosmossdk.io/store/snapshots/types"
+	"cosmossdk.io/store/cachemulti"
+	"cosmossdk.io/store/dbadapter"
+	"cosmossdk.io/store/iavl"
+	"cosmossdk.io/store/mem"
+	pruningtypes "cosmossdk.io/store/pruning/types"
+	"cosmossdk.io/store/tracekv"
+	"cosmossdk.io/store/transient"
+	"cosmossdk.io/store/types"
 )
 
 const (
@@ -42,13 +42,18 @@ const (
 	snapshotMaxItemSize = int(64e6) // SDK has no key/value size limit, so we set an arbitrary limit
 )
 
+// WriteListener interface for store listeners
+type WriteListener interface {
+	OnWrite(storeKey types.StoreKey, key, value []byte, delete bool)
+}
+
 // Store is composed of many CommitStores. Name contrasts with
 // cacheMultiStore which is used for branching other MultiStores. It implements
 // the CommitMultiStore interface.
 type Store struct {
 	db             dbm.DB
 	lastCommitInfo *types.CommitInfo
-	pruningOpts    types.PruningOptions
+	pruningOpts    pruningtypes.PruningOptions
 	iavlCacheSize  int
 	storesParams   map[types.StoreKey]storeParams
 	stores         map[types.StoreKey]types.CommitKVStore
@@ -63,7 +68,7 @@ type Store struct {
 
 	interBlockCache types.MultiStorePersistentCache
 
-	listeners map[types.StoreKey][]types.WriteListener
+	listeners map[types.StoreKey][]WriteListener
 }
 
 var (
@@ -78,31 +83,49 @@ var (
 func NewStore(db dbm.DB) *Store {
 	return &Store{
 		db:            db,
-		pruningOpts:   types.PruneNothing,
+		pruningOpts:   pruningtypes.NewPruningOptions(pruningtypes.PruningNothing),
 		iavlCacheSize: iavl.DefaultIAVLCacheSize,
 		storesParams:  make(map[types.StoreKey]storeParams),
 		stores:        make(map[types.StoreKey]types.CommitKVStore),
 		keysByName:    make(map[string]types.StoreKey),
 		PruneHeights:  make([]int64, 0),
-		listeners:     make(map[types.StoreKey][]types.WriteListener),
+		listeners:     make(map[types.StoreKey][]WriteListener),
 		removalMap:    make(map[types.StoreKey]bool),
 	}
 }
 
 // GetPruning fetches the pruning strategy from the root store.
-func (rs *Store) GetPruning() types.PruningOptions {
+func (rs *Store) GetPruning() pruningtypes.PruningOptions {
 	return rs.pruningOpts
 }
 
 // SetPruning sets the pruning strategy on the root store and all the sub-stores.
-// Note, calling SetPruning on the root store prior to LoadVersion or
-// LoadLatestVersion performs a no-op as the stores aren't mounted yet.
-func (rs *Store) SetPruning(pruningOpts types.PruningOptions) {
+func (rs *Store) SetPruning(pruningOpts pruningtypes.PruningOptions) {
 	rs.pruningOpts = pruningOpts
 }
 
 func (rs *Store) SetIAVLCacheSize(cacheSize int) {
 	rs.iavlCacheSize = cacheSize
+}
+
+// SetIAVLDisableFastNode is a no-op for cosmprund
+func (rs *Store) SetIAVLDisableFastNode(disable bool) {
+	// no-op for cosmprund
+}
+
+// SetIAVLSyncPruning is a no-op for cosmprund
+func (rs *Store) SetIAVLSyncPruning(sync bool) {
+	// no-op for cosmprund
+}
+
+// SetMetrics is a no-op for cosmprund
+func (rs *Store) SetMetrics(m metrics.StoreMetrics) {
+	// no-op for cosmprund
+}
+
+// SetSnapshotInterval is a no-op for cosmprund
+func (rs *Store) SetSnapshotInterval(interval uint64) {
+	// no-op for cosmprund
 }
 
 // SetLazyLoading sets if the iavl store should be loaded lazily or not
@@ -346,20 +369,14 @@ func (rs *Store) TracingEnabled() bool {
 	return rs.traceWriter != nil
 }
 
-// AddListeners adds listeners for a specific KVStore
-func (rs *Store) AddListeners(key types.StoreKey, listeners []types.WriteListener) {
-	if ls, ok := rs.listeners[key]; ok {
-		rs.listeners[key] = append(ls, listeners...)
-	} else {
-		rs.listeners[key] = listeners
-	}
+// AddListeners adds listeners for a specific set of KVStores - matches new SDK v0.53 signature
+func (rs *Store) AddListeners(keys []types.StoreKey) {
+	// Simplified for cosmprund - we don't use listeners for pruning
 }
 
 // ListeningEnabled returns if listening is enabled for a specific KVStore
 func (rs *Store) ListeningEnabled(key types.StoreKey) bool {
-	if ls, ok := rs.listeners[key]; ok {
-		return len(ls) != 0
-	}
+	// Always false for cosmprund
 	return false
 }
 
@@ -372,6 +389,37 @@ func (rs *Store) LastCommitID() types.CommitID {
 	}
 
 	return rs.lastCommitInfo.CommitID()
+}
+
+// LatestVersion returns the latest version in the store
+func (rs *Store) LatestVersion() int64 {
+	if rs.lastCommitInfo == nil {
+		return GetLatestVersion(rs.db)
+	}
+	return rs.lastCommitInfo.Version
+}
+
+// PopStateCache returns accumulated state changes from listeners - no-op for cosmprund
+func (rs *Store) PopStateCache() []*types.StoreKVPair {
+	return nil
+}
+
+// PruneSnapshotHeight prunes a snapshot at a given height - no-op for cosmprund
+func (rs *Store) PruneSnapshotHeight(height int64) {
+	// no-op for cosmprund
+}
+
+// RollbackToVersion rolls back the store to a previous version - not implemented for cosmprund
+func (rs *Store) RollbackToVersion(version int64) error {
+	return fmt.Errorf("RollbackToVersion not supported in cosmprund")
+}
+
+// WorkingHash returns the working hash of the root store
+func (rs *Store) WorkingHash() []byte {
+	if rs.lastCommitInfo == nil {
+		return nil
+	}
+	return rs.lastCommitInfo.Hash()
 }
 
 // Commit implements Committer/CommitStore.
@@ -409,14 +457,8 @@ func (rs *Store) Commit() types.CommitID {
 	// be pruned, where pruneHeight = (commitHeight - 1) - KeepRecent.
 	if int64(rs.pruningOpts.KeepRecent) < previousHeight {
 		pruneHeight := previousHeight - int64(rs.pruningOpts.KeepRecent)
-		// We consider this height to be pruned iff:
-		//
-		// - KeepEvery is zero as that means that all heights should be pruned.
-		// - KeepEvery % (height - KeepRecent) != 0 as that means the height is not
-		// a 'snapshot' height.
-		if rs.pruningOpts.KeepEvery == 0 || pruneHeight%int64(rs.pruningOpts.KeepEvery) != 0 {
-			rs.PruneHeights = append(rs.PruneHeights, pruneHeight)
-		}
+		// For cosmprund, we always add to prune heights (no KeepEvery logic)
+		rs.PruneHeights = append(rs.PruneHeights, pruneHeight)
 	}
 
 	// batch prune if the current height is a pruning interval height
@@ -440,6 +482,15 @@ func (rs *Store) PruneStores() {
 	}
 
 	wg := sync.WaitGroup{}
+	
+	// Find the highest version to delete (prune up to this height)
+	var pruneToHeight int64
+	if len(rs.PruneHeights) > 0 {
+		pruneToHeight = rs.PruneHeights[len(rs.PruneHeights)-1]
+	} else {
+		return
+	}
+	
 	for key, store := range rs.stores {
 		wg.Add(1)
 		if store.GetStoreType() == types.StoreTypeIAVL {
@@ -448,7 +499,7 @@ func (rs *Store) PruneStores() {
 			go func(k types.StoreKey) {
 				store = rs.GetCommitKVStore(k)
 				fmt.Println("pruning store:", k.Name())
-				if err := store.(*iavl.Store).DeleteVersions(rs.PruneHeights...); err != nil {
+				if err := store.(*iavl.Store).DeleteVersionsTo(pruneToHeight); err != nil {
 					if errCause := errors.Cause(err); errCause != nil && errCause != iavltree.ErrVersionDoesNotExist {
 						fmt.Println("error pruning store:", k.Name())
 						if !strings.HasPrefix(err.Error(), "cannot delete latest saved version") {
@@ -495,7 +546,7 @@ func (rs *Store) CacheWrapWithTrace(_ io.Writer, _ types.TraceContext) types.Cac
 }
 
 // CacheWrapWithListeners implements the CacheWrapper interface.
-func (rs *Store) CacheWrapWithListeners(_ types.StoreKey, _ []types.WriteListener) types.CacheWrap {
+func (rs *Store) CacheWrapWithListeners(_ types.StoreKey, _ []WriteListener) types.CacheWrap {
 	return rs.CacheWrap()
 }
 
@@ -506,7 +557,7 @@ func (rs *Store) CacheMultiStore() types.CacheMultiStore {
 	for k, v := range rs.stores {
 		stores[k] = v
 	}
-	return cachemulti.NewStore(rs.db, stores, rs.keysByName, rs.traceWriter, rs.traceContext, rs.listeners)
+	return cachemulti.NewStore(rs.db, stores, rs.keysByName, rs.traceWriter, rs.traceContext)
 }
 
 // CacheMultiStoreWithVersion is analogous to CacheMultiStore except that it
@@ -536,7 +587,7 @@ func (rs *Store) CacheMultiStoreWithVersion(version int64) (types.CacheMultiStor
 		}
 	}
 
-	return cachemulti.NewStore(rs.db, cachedStores, rs.keysByName, rs.traceWriter, rs.traceContext, rs.listeners), nil
+	return cachemulti.NewStore(rs.db, cachedStores, rs.keysByName, rs.traceWriter, rs.traceContext), nil
 }
 
 // GetStore returns a mounted Store for a given StoreKey. If the StoreKey does
@@ -570,10 +621,8 @@ func (rs *Store) GetKVStore(key types.StoreKey) types.KVStore {
 	if rs.TracingEnabled() {
 		store = tracekv.NewStore(store, rs.traceWriter, rs.traceContext)
 	}
-	if rs.ListeningEnabled(key) {
-		store = listenkv.NewStore(store, key, rs.listeners[key])
-	}
-
+	// Listeners disabled for cosmprund
+	
 	return store
 }
 
@@ -594,33 +643,52 @@ func (rs *Store) getStoreByName(name string) types.Store {
 // modified to remove the substore prefix.
 // Ie. `req.Path` here is `/<substore>/<path>`, and trimmed to `/<path>` for the substore.
 // TODO: add proof for `multistore -> substore`.
-func (rs *Store) Query(req abci.RequestQuery) abci.ResponseQuery {
+func (rs *Store) Query(req *types.RequestQuery) (*types.ResponseQuery, error) {
 	path := req.Path
 	storeName, subpath, err := parsePath(path)
 	if err != nil {
-		return sdkerrors.QueryResult(err)
+		return &types.ResponseQuery{
+			Code: 1,
+			Log:  err.Error(),
+		}, err
 	}
 
 	store := rs.getStoreByName(storeName)
 	if store == nil {
-		return sdkerrors.QueryResult(sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "no such store: %s", storeName))
+		err := fmt.Errorf("no such store: %s", storeName)
+		return &types.ResponseQuery{
+			Code: 1,
+			Log:  err.Error(),
+		}, err
 	}
 
 	queryable, ok := store.(types.Queryable)
 	if !ok {
-		return sdkerrors.QueryResult(sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "store %s (type %T) doesn't support queries", storeName, store))
+		err := fmt.Errorf("store %s (type %T) doesn't support queries", storeName, store)
+		return &types.ResponseQuery{
+			Code: 1,
+			Log:  err.Error(),
+		}, err
 	}
 
 	// trim the path and make the query
-	req.Path = subpath
-	res := queryable.Query(req)
+	reqCopy := *req
+	reqCopy.Path = subpath
+	res, err := queryable.Query(&reqCopy)
+	if err != nil {
+		return res, err
+	}
 
 	if !req.Prove || !RequireProof(subpath) {
-		return res
+		return res, nil
 	}
 
 	if res.ProofOps == nil || len(res.ProofOps.Ops) == 0 {
-		return sdkerrors.QueryResult(sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "proof is unexpectedly empty; ensure height has not been pruned"))
+		err := fmt.Errorf("proof is unexpectedly empty; ensure height has not been pruned")
+		return &types.ResponseQuery{
+			Code: 1,
+			Log:  err.Error(),
+		}, err
 	}
 
 	// If the request's height is the latest height we've committed, then utilize
@@ -633,14 +701,17 @@ func (rs *Store) Query(req abci.RequestQuery) abci.ResponseQuery {
 	} else {
 		commitInfo, err = getCommitInfo(rs.db, res.Height)
 		if err != nil {
-			return sdkerrors.QueryResult(err)
+			return &types.ResponseQuery{
+				Code: 1,
+				Log:  err.Error(),
+			}, err
 		}
 	}
 
 	// Restore origin path and append proof op.
 	res.ProofOps.Ops = append(res.ProofOps.Ops, commitInfo.ProofOp(storeName))
 
-	return res
+	return res, nil
 }
 
 // SetInitialVersion sets the initial version of the IAVL tree. It is used when
@@ -667,7 +738,7 @@ func (rs *Store) SetInitialVersion(version int64) error {
 // Returns error if it doesn't start with /
 func parsePath(path string) (storeName string, subpath string, err error) {
 	if !strings.HasPrefix(path, "/") {
-		return storeName, subpath, sdkerrors.Wrapf(sdkerrors.ErrUnknownRequest, "invalid path: %s", path)
+		return storeName, subpath, fmt.Errorf("invalid path: %s", path)
 	}
 
 	paths := strings.SplitN(path[1:], "/", 2)
@@ -682,19 +753,22 @@ func parsePath(path string) (storeName string, subpath string, err error) {
 
 //---------------------- Snapshotting ------------------
 
-// Snapshot implements snapshottypes.Snapshotter. The snapshot output for a given format must be
-// identical across nodes such that chunks from different sources fit together. If the output for a
-// given format changes (at the byte level), the snapshot format must be bumped - see
-// TestMultistoreSnapshot_Checksum test.
-func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, error) {
+// Snapshot implements the new snapshottypes.Snapshotter interface (SDK v0.53+)
+func (rs *Store) Snapshot(height uint64, protoWriter protoio.Writer) error {
+	// Not used by cosmprund
+	return fmt.Errorf("snapshots not supported in cosmprund")
+}
+
+// SnapshotLegacy is the old Snapshot implementation - kept for reference
+func (rs *Store) SnapshotLegacy(height uint64, format uint32) (<-chan io.ReadCloser, error) {
 	if format != snapshottypes.CurrentFormat {
-		return nil, sdkerrors.Wrapf(snapshottypes.ErrUnknownFormat, "format %v", format)
+		return nil, fmt.Errorf("unknown snapshot format %v", format)
 	}
 	if height == 0 {
-		return nil, sdkerrors.Wrap(sdkerrors.ErrLogic, "cannot snapshot height 0")
+		return nil, fmt.Errorf("cannot snapshot height 0")
 	}
 	if height > uint64(rs.LastCommitID().Version) {
-		return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic, "cannot snapshot future height %v", height)
+		return nil, fmt.Errorf("cannot snapshot future height %v", height)
 	}
 
 	// Collect stores to snapshot (only IAVL stores are supported)
@@ -711,8 +785,7 @@ func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, e
 			// Non-persisted stores shouldn't be snapshotted
 			continue
 		default:
-			return nil, sdkerrors.Wrapf(sdkerrors.ErrLogic,
-				"don't know how to snapshot store %q of type %T", key.Name(), store)
+			return nil, fmt.Errorf("don't know how to snapshot store %q of type %T", key.Name(), store)
 		}
 	}
 	sort.Slice(stores, func(i, j int) bool {
@@ -734,7 +807,7 @@ func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, e
 		}()
 		zWriter, err := zlib.NewWriterLevel(bufWriter, 7)
 		if err != nil {
-			chunkWriter.CloseWithError(sdkerrors.Wrap(err, "zlib failure"))
+			chunkWriter.CloseWithError(fmt.Errorf("zlib failure: %w", err))
 			return
 		}
 		defer func() {
@@ -760,9 +833,9 @@ func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, e
 				return
 			}
 			defer exporter.Close()
-			err = protoWriter.WriteMsg(&types.SnapshotItem{
-				Item: &types.SnapshotItem_Store{
-					Store: &types.SnapshotStoreItem{
+			err = protoWriter.WriteMsg(&snapshottypes.SnapshotItem{
+				Item: &snapshottypes.SnapshotItem_Store{
+					Store: &snapshottypes.SnapshotStoreItem{
 						Name: store.name,
 					},
 				},
@@ -774,15 +847,15 @@ func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, e
 
 			for {
 				node, err := exporter.Next()
-				if err == iavltree.ExportDone {
+				if err != nil && err.Error() == "export is complete" {
 					break
 				} else if err != nil {
 					chunkWriter.CloseWithError(err)
 					return
 				}
-				err = protoWriter.WriteMsg(&types.SnapshotItem{
-					Item: &types.SnapshotItem_IAVL{
-						IAVL: &types.SnapshotIAVLItem{
+				err = protoWriter.WriteMsg(&snapshottypes.SnapshotItem{
+					Item: &snapshottypes.SnapshotItem_IAVL{
+						IAVL: &snapshottypes.SnapshotIAVLItem{
 							Key:     node.Key,
 							Value:   node.Value,
 							Height:  int32(node.Height),
@@ -802,19 +875,24 @@ func (rs *Store) Snapshot(height uint64, format uint32) (<-chan io.ReadCloser, e
 	return ch, nil
 }
 
-// Restore implements snapshottypes.Snapshotter.
-func (rs *Store) Restore(
+// Restore implements the new snapshottypes.Snapshotter interface (SDK v0.53+)
+func (rs *Store) Restore(height uint64, format uint32, protoReader protoio.Reader) (snapshottypes.SnapshotItem, error) {
+	// Not used by cosmprund - return empty item
+	return snapshottypes.SnapshotItem{}, nil
+}
+
+// RestoreFromChunks is the old Restore implementation - kept for potential future use
+func (rs *Store) RestoreFromChunks(
 	height uint64, format uint32, chunks <-chan io.ReadCloser, ready chan<- struct{},
 ) error {
 	if format != snapshottypes.CurrentFormat {
-		return sdkerrors.Wrapf(snapshottypes.ErrUnknownFormat, "format %v", format)
+		return fmt.Errorf("unknown snapshot format %v", format)
 	}
 	if height == 0 {
-		return sdkerrors.Wrap(sdkerrors.ErrLogic, "cannot restore snapshot at height 0")
+		return fmt.Errorf("cannot restore snapshot at height 0")
 	}
 	if height > uint64(math.MaxInt64) {
-		return sdkerrors.Wrapf(snapshottypes.ErrInvalidMetadata,
-			"snapshot height %v cannot exceed %v", height, int64(math.MaxInt64))
+		return fmt.Errorf("snapshot height %v cannot exceed %v", height, int64(math.MaxInt64))
 	}
 
 	// Signal readiness. Must be done before the readers below are set up, since the zlib
@@ -829,7 +907,7 @@ func (rs *Store) Restore(
 	defer chunkReader.Close()
 	zReader, err := zlib.NewReader(chunkReader)
 	if err != nil {
-		return sdkerrors.Wrap(err, "zlib failure")
+		return fmt.Errorf("zlib failure: %w", err)
 	}
 	defer zReader.Close()
 	protoReader := protoio.NewDelimitedReader(zReader, snapshotMaxItemSize)
@@ -840,40 +918,39 @@ func (rs *Store) Restore(
 	// SnapshotNodeItem (i.e. ExportNode) until we reach the next SnapshotStoreItem or EOF.
 	var importer *iavltree.Importer
 	for {
-		item := &types.SnapshotItem{}
+		item := &snapshottypes.SnapshotItem{}
 		err := protoReader.ReadMsg(item)
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return sdkerrors.Wrap(err, "invalid protobuf message")
+			return fmt.Errorf("invalid protobuf message: %w", err)
 		}
 
 		switch item := item.Item.(type) {
-		case *types.SnapshotItem_Store:
+		case *snapshottypes.SnapshotItem_Store:
 			if importer != nil {
 				err = importer.Commit()
 				if err != nil {
-					return sdkerrors.Wrap(err, "IAVL commit failed")
+					return fmt.Errorf("IAVL commit failed: %w", err)
 				}
 				importer.Close()
 			}
 			store, ok := rs.getStoreByName(item.Store.Name).(*iavl.Store)
 			if !ok || store == nil {
-				return sdkerrors.Wrapf(sdkerrors.ErrLogic, "cannot import into non-IAVL store %q", item.Store.Name)
+				return fmt.Errorf("cannot import into non-IAVL store %q", item.Store.Name)
 			}
 			importer, err = store.Import(int64(height))
 			if err != nil {
-				return sdkerrors.Wrap(err, "import failed")
+				return fmt.Errorf("import failed: %w", err)
 			}
 			defer importer.Close()
 
-		case *types.SnapshotItem_IAVL:
+		case *snapshottypes.SnapshotItem_IAVL:
 			if importer == nil {
-				return sdkerrors.Wrap(sdkerrors.ErrLogic, "received IAVL node item before store item")
+				return fmt.Errorf("received IAVL node item before store item")
 			}
 			if item.IAVL.Height > math.MaxInt8 {
-				return sdkerrors.Wrapf(sdkerrors.ErrLogic, "node height %v cannot exceed %v",
-					item.IAVL.Height, math.MaxInt8)
+				return fmt.Errorf("node height %v cannot exceed %v", item.IAVL.Height, math.MaxInt8)
 			}
 			node := &iavltree.ExportNode{
 				Key:     item.IAVL.Key,
@@ -891,18 +968,18 @@ func (rs *Store) Restore(
 			}
 			err := importer.Add(node)
 			if err != nil {
-				return sdkerrors.Wrap(err, "IAVL node import failed")
+				return fmt.Errorf("IAVL node import failed: %w", err)
 			}
 
 		default:
-			return sdkerrors.Wrapf(sdkerrors.ErrLogic, "unknown snapshot item %T", item)
+			return fmt.Errorf("unknown snapshot item %T", item)
 		}
 	}
 
 	if importer != nil {
 		err := importer.Commit()
 		if err != nil {
-			return sdkerrors.Wrap(err, "IAVL commit failed")
+			return fmt.Errorf("IAVL commit failed: %w", err)
 		}
 		importer.Close()
 	}
@@ -928,11 +1005,15 @@ func (rs *Store) loadCommitStoreFromParams(key types.StoreKey, id types.CommitID
 	case types.StoreTypeIAVL:
 		var store types.CommitKVStore
 		var err error
+		
+		// Create a no-op logger and metrics for cosmprund
+		logger := log.NewNopLogger()
+		storeMetrics := metrics.NewNoOpMetrics()
 
 		if params.initialVersion == 0 {
-			store, err = iavl.LoadStore(db, id, rs.lazyLoading, rs.iavlCacheSize)
+			store, err = iavl.LoadStore(db, logger, key, id, rs.iavlCacheSize, rs.lazyLoading, storeMetrics)
 		} else {
-			store, err = iavl.LoadStoreWithInitialVersion(db, id, rs.lazyLoading, params.initialVersion, rs.iavlCacheSize)
+			store, err = iavl.LoadStoreWithInitialVersion(db, logger, key, id, params.initialVersion, rs.iavlCacheSize, rs.lazyLoading, storeMetrics)
 		}
 
 		if err != nil {
