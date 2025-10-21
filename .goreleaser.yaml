@@ -1,0 +1,60 @@
+project_name: cosmprund
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: cosmprund
+    main: ./main.go
+    binary: cosmprund
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: cosmprund
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'README'
+      - 'Merge pull request'
+      - 'Merge branch'
+
+release:
+  github:
+    owner: akash-network
+    name: cosmprund
+  draft: false
+  prerelease: auto
+
