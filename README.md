@@ -16,9 +16,42 @@ Prunes both application state (IAVL stores) and CometBFT block/state data to red
 
 - Akash Network v1.0.0 or higher
 - Cosmos SDK v0.53+
-- Go 1.24.2+
 
 ## Installation
+
+### Option 1: Download Pre-built Binary (Recommended)
+
+Download the latest release for your platform:
+
+```bash
+# Linux AMD64 (most common)
+wget https://github.com/akash-network/cosmprund/releases/latest/download/cosmprund_linux_amd64.zip
+unzip cosmprund_linux_amd64.zip
+chmod +x cosmprund
+sudo mv cosmprund /usr/local/bin/
+
+# Linux ARM64
+wget https://github.com/akash-network/cosmprund/releases/latest/download/cosmprund_linux_arm64.zip
+unzip cosmprund_linux_arm64.zip
+chmod +x cosmprund
+sudo mv cosmprund /usr/local/bin/
+
+# macOS Intel
+wget https://github.com/akash-network/cosmprund/releases/latest/download/cosmprund_darwin_amd64.zip
+unzip cosmprund_darwin_amd64.zip
+chmod +x cosmprund
+sudo mv cosmprund /usr/local/bin/
+
+# macOS Apple Silicon
+wget https://github.com/akash-network/cosmprund/releases/latest/download/cosmprund_darwin_arm64.zip
+unzip cosmprund_darwin_arm64.zip
+chmod +x cosmprund
+sudo mv cosmprund /usr/local/bin/
+```
+
+### Option 2: Build from Source
+
+Requirements: Go 1.24.2+
 
 ```bash
 # Clone and build
