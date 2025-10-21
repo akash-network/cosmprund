@@ -1,21 +1,20 @@
 module github.com/binaryholdings/cosmos-pruner
 
-go 1.23.8
-
-toolchain go1.24.1
+go 1.24.2
 
 require (
+	cosmossdk.io/log v1.6.0
 	cosmossdk.io/store v1.1.2
-	cosmossdk.io/x/evidence v0.2.0
-	cosmossdk.io/x/feegrant v0.2.0
-	cosmossdk.io/x/upgrade v0.2.0
-	github.com/cometbft/cometbft v0.38.17
+	cosmossdk.io/x/evidence v0.1.1
+	cosmossdk.io/x/feegrant v0.1.1
+	cosmossdk.io/x/upgrade v0.1.4
+	github.com/cometbft/cometbft v0.38.19
+	github.com/cometbft/cometbft-db v0.14.1
 	github.com/cosmos/cosmos-db v1.1.1
-	github.com/cosmos/cosmos-sdk v0.53.3
+	github.com/cosmos/cosmos-sdk v0.53.4
 	github.com/cosmos/gogoproto v1.7.0
-	github.com/cosmos/iavl v1.2.2
-	github.com/cosmos/ibc-go/v8 v8.7.0
-	github.com/neilotoole/errgroup v0.1.5
+	github.com/cosmos/iavl v1.2.6
+	github.com/cosmos/ibc-go/v8 v8.5.2
 	github.com/pkg/errors v0.9.1
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.1
@@ -29,7 +28,6 @@ require (
 	cosmossdk.io/core v0.11.3 // indirect
 	cosmossdk.io/depinject v1.2.1 // indirect
 	cosmossdk.io/errors v1.0.2 // indirect
-	cosmossdk.io/log v1.6.0 // indirect
 	cosmossdk.io/math v1.5.3 // indirect
 	cosmossdk.io/schema v1.1.0 // indirect
 	cosmossdk.io/x/tx v0.14.0 // indirect
@@ -54,7 +52,6 @@ require (
 	github.com/cockroachdb/pebble v1.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.6 // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
-	github.com/cometbft/cometbft-db v0.14.1 // indirect
 	github.com/cosmos/btcutil v1.0.5 // indirect
 	github.com/cosmos/cosmos-proto v1.0.0-beta.5 // indirect
 	github.com/cosmos/go-bip39 v1.0.0 // indirect
