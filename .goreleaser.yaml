@@ -1,5 +1,3 @@
-version: 2
-
 project_name: cosmprund
 
 before:
@@ -37,7 +35,8 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 
-snapshot: {}
+snapshot:
+  name_template: "{{ .Version }}-next"
 
 changelog:
   sort: asc
