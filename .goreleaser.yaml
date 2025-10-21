@@ -24,6 +24,7 @@ builds:
 
 archives:
   - id: cosmprund
+    format: zip
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
