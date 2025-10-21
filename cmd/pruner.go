@@ -25,7 +25,6 @@ import (
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
 	ibctransfertypes "github.com/cosmos/ibc-go/v8/modules/apps/transfer/types"
-	"github.com/neilotoole/errgroup"
 	"github.com/spf13/cobra"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	db "github.com/cosmos/cosmos-db"
@@ -43,29 +42,24 @@ func pruneCmd() *cobra.Command {
 		Short: "prune data from the application store and block store",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-
-			ctx := cmd.Context()
-			errs, _ := errgroup.WithContext(ctx)
 			var err error
+			
+			// Run Tendermint pruning first (if enabled)
 			if tendermint {
-				errs.Go(func() error {
-					if err = pruneTMData(args[0]); err != nil {
-						return err
-					}
-					return nil
-				})
+				if err = pruneTMData(args[0]); err != nil {
+					return err
+				}
 			}
 
+			// Then run application state pruning (if enabled)
 			if cosmosSdk {
 				err = pruneAppState(args[0])
 				if err != nil {
 					return err
 				}
-				return nil
-
 			}
 
-			return errs.Wait()
+			return nil
 		},
 	}
 	return cmd
@@ -214,7 +208,6 @@ func pruneAppState(home string) error {
 			"provider",   // provider.StoreKey,
 			"audit",      // audit.StoreKey,
 			"cert",       // cert.StoreKey,
-			"take",       // take.StoreKey (new in v1.0.0),
 		)
 		for key, value := range akashKeys {
 			keys[key] = value
@@ -624,6 +617,16 @@ func pruneAppState(home string) error {
 		}
 		
 		fmt.Printf("  Versions: %d total (range: %d-%d)\n", len(versionsBefore), firstVersion, lastVersion)
+		
+		// Safety: Don't prune stores that are too new
+		// Need at least 4x keepVersions to have meaningful pruning and safety margin
+		minVersionsForPruning := int(keepVersions) * 4
+		if len(versionsBefore) < minVersionsForPruning {
+			fmt.Printf("  Store too new (%d versions < %d threshold), skipping for safety\n\n", len(versionsBefore), minVersionsForPruning)
+			successCount++
+			continue
+		}
+		
 		fmt.Printf("  Pruning to version %d (keeping last %d)\n", pruneToVersion, keepVersions)
 		
 		// Use raw IAVL MutableTree with SyncOption(true) for offline pruning
@@ -657,31 +660,42 @@ func pruneAppState(home string) error {
 		
 		firstVer := int64(availableVersionsBefore[0])
 		
+		// CRITICAL FIX: Only delete versions that actually exist in this store!
+		// Don't try to delete versions before firstVer
+		actualPruneToVersion := pruneToVersion
+		if actualPruneToVersion < firstVer {
+			// This store doesn't have versions that old
+			fmt.Printf("  Store only has versions from %d onwards, nothing to prune\n\n", firstVer)
+			successCount++
+			continue
+		}
+		
 		// Prune in batches
 		batchSize := int64(10000)
-		totalBatches := (pruneToVersion - firstVer + batchSize - 1) / batchSize
-		fmt.Printf("  Pruning in %d batches of %d versions...\n", totalBatches, batchSize)
+		deletionRange := actualPruneToVersion - firstVer + 1
+		totalBatches := (deletionRange + batchSize - 1) / batchSize
+		fmt.Printf("  Pruning in %d batches (deleting %d-%d)...\n", totalBatches, firstVer, actualPruneToVersion)
 		
 		batchCount := 0
 		hadError := false
 		
-		for i := firstVer; i < pruneToVersion; i += batchSize {
-			j := i + batchSize
-			if j > pruneToVersion {
-				j = pruneToVersion
+		for currentVer := firstVer; currentVer < actualPruneToVersion; currentVer += batchSize {
+			deleteUpTo := currentVer + batchSize - 1
+			if deleteUpTo > actualPruneToVersion {
+				deleteUpTo = actualPruneToVersion
 			}
 			
 			batchCount++
 			if batchCount%5 == 1 || batchCount == int(totalBatches) {
-				fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, j)
+				fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, deleteUpTo)
 			}
 			
-			err = mutableTree.DeleteVersionsTo(j)
+			err = mutableTree.DeleteVersionsTo(deleteUpTo)
 			if err != nil {
 				errMsg := err.Error()
 				if errMsg == "version does not exist" || 
 				   strings.Contains(errMsg, "is less than or equal to") {
-					continue // Skip benign errors
+					continue
 				}
 				fmt.Printf("  ⚠️  Error at batch %d: %v\n", batchCount, err)
 				hadError = true
@@ -691,15 +705,32 @@ func pruneAppState(home string) error {
 		
 		// Check results
 		availableVersionsAfter := mutableTree.AvailableVersions()
-		deleted := len(availableVersionsBefore) - len(availableVersionsAfter)
+		countBefore := len(availableVersionsBefore)
+		countAfter := len(availableVersionsAfter)
+		deleted := countBefore - countAfter
 		
 		if hadError {
-			fmt.Printf("  ⚠️  Partial: deleted %d versions\n\n", deleted)
+			fmt.Printf("  ⚠️  Partial: deleted %d of %d versions (%d remaining)\n\n", deleted, countBefore, countAfter)
 			errorCount++
 			continue
 		}
 		
-		fmt.Printf("  ✓ Deleted %d versions (%d remaining)\n\n", deleted, len(availableVersionsAfter))
+		if deleted > 0 {
+			fmt.Printf("  ✓ Deleted %d versions (%d remaining)\n\n", deleted, countAfter)
+		} else if deleted == 0 {
+			fmt.Printf("  No versions were deleted (still %d versions)\n\n", countAfter)
+		} else {
+			// Unexpected increase - show diagnostics
+			fmt.Printf("  ⚠️  Unexpected: version count increased (was %d, now %d)\n", countBefore, countAfter)
+			if countAfter > 0 && countAfter < 10 {
+				fmt.Printf("  After array: %v\n", availableVersionsAfter)
+			} else if countAfter > 0 {
+				fmt.Printf("  After range: %d - %d\n", availableVersionsAfter[0], availableVersionsAfter[countAfter-1])
+			}
+			fmt.Printf("  WARNING: This store may be corrupted, skipping\n\n")
+			errorCount++
+			continue
+		}
 		
 		successCount++
 	}
