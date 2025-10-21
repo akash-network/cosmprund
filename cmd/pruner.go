@@ -3,8 +3,15 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
+	"cosmossdk.io/log"
 	storetypes "cosmossdk.io/store/types"
+	"github.com/cometbft/cometbft/state"
+	tmstore "github.com/cometbft/cometbft/store"
+	tmdb "github.com/cometbft/cometbft-db"
+	iavltree "github.com/cosmos/iavl"
+	iavldb "github.com/cosmos/iavl/db"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	authzkeeper "github.com/cosmos/cosmos-sdk/x/authz/keeper"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
@@ -84,14 +91,14 @@ func pruneAppState(home string) error {
 	//TODO: need to get all versions in the store, setting randomly is too slow
 	fmt.Println("pruning application state")
 
-	// only mount keys from core sdk
-	// todo allow for other keys to be mounted
-			keys := storetypes.NewKVStoreKeys(
+	// Mount keys from core SDK
+	keys := storetypes.NewKVStoreKeys(
 		authtypes.StoreKey, banktypes.StoreKey, stakingtypes.StoreKey, "crisis",
 		minttypes.StoreKey, distrtypes.StoreKey, slashingtypes.StoreKey,
 		govtypes.StoreKey, paramtypes.StoreKey, "ibc", upgradetypes.StoreKey, feegrant.StoreKey,
 		evidencetypes.StoreKey, ibctransfertypes.StoreKey,
 		authzkeeper.StoreKey,
+		"consensus", // consensus params store (new in SDK v0.53)
 	)
 
 	if app == "osmosis" {
@@ -549,121 +556,242 @@ func pruneAppState(home string) error {
 		}
 	}
 
-	// TODO: cleanup app state
-	appStore := rootmulti.NewStore(appDB)
-
-	for _, value := range keys {
-		appStore.MountStoreWithDB(value, storetypes.StoreTypeIAVL, nil)
+	// Prune each store independently using raw IAVL MutableTree
+	// This bypasses SDK wrapper limitations and enables offline pruning
+	
+	fmt.Println("\n=== Pruning Application Stores ===")
+	
+	latestHeight := rootmulti.GetLatestVersion(appDB)
+	fmt.Printf("Latest height: %d\n", latestHeight)
+	
+	if latestHeight <= 0 {
+		return fmt.Errorf("database has no valid heights to prune, latest height: %d", latestHeight)
 	}
+	
+	// Use the --versions flag value
+	keepVersions := versions
+	if keepVersions == 0 {
+		keepVersions = 10
+	}
+	
+	fmt.Printf("Keeping last %d versions\n", keepVersions)
+	fmt.Printf("Processing %d stores...\n\n", len(keys))
+	
+	// Process each store independently
+	successCount := 0
+	errorCount := 0
+	
+	for _, storeKey := range keys {
+		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+		fmt.Printf("Store: %s\n", storeKey.Name())
+		
+		// Create a new store for this specific key
+		appStore := rootmulti.NewStore(appDB)
+		appStore.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, nil)
+		
+		// Try to load this store
+		err = appStore.LoadLatestVersion()
+		if err != nil {
+			fmt.Printf("  ⚠️  Skipping (doesn't exist or corrupted)\n\n")
+			errorCount++
+			continue
+		}
+		
+		// Get all versions BEFORE pruning
+		versionsBefore := appStore.GetAllVersions()
+		if len(versionsBefore) == 0 {
+			fmt.Printf("  No versions, skipping\n\n")
+			successCount++
+			continue
+		}
+		
+		firstVersion := int64(versionsBefore[0])
+		lastVersion := int64(versionsBefore[len(versionsBefore)-1])
+		
+		// Calculate pruning target
+		if len(versionsBefore) <= int(keepVersions) {
+			fmt.Printf("  Only %d versions, nothing to prune\n\n", len(versionsBefore))
+			successCount++
+			continue
+		}
+		
+		// Calculate the highest version to delete (keep last N versions)
+		pruneToVersion := lastVersion - int64(keepVersions)
+		if pruneToVersion < firstVersion {
+			fmt.Printf("  Nothing to prune\n\n")
+			successCount++
+			continue
+		}
+		
+		fmt.Printf("  Versions: %d total (range: %d-%d)\n", len(versionsBefore), firstVersion, lastVersion)
+		fmt.Printf("  Pruning to version %d (keeping last %d)\n", pruneToVersion, keepVersions)
+		
+		// Use raw IAVL MutableTree with SyncOption(true) for offline pruning
+		storePrefix := fmt.Sprintf("s/k:%s/", storeKey.Name())
+		cosmosdbPrefix := db.NewPrefixDB(appDB, []byte(storePrefix))
+		wrappedDB := iavldb.NewWrapper(cosmosdbPrefix)
+		
+		logger := log.NewNopLogger()
+		mutableTree := iavltree.NewMutableTree(
+			wrappedDB, 
+			1000000, 
+			false, 
+			logger,
+			iavltree.SyncOption(true),           // Force fsync for offline pruning
+			iavltree.AsyncPruningOption(false),  // Synchronous deletion
+		)
+		
+		_, err := mutableTree.Load()
+		if err != nil {
+			fmt.Printf("  ⚠️  ERROR: %v\n\n", err)
+			errorCount++
+			continue
+		}
+		
+		availableVersionsBefore := mutableTree.AvailableVersions()
+		if len(availableVersionsBefore) == 0 {
+			fmt.Printf("  No versions\n\n")
+			successCount++
+			continue
+		}
+		
+		firstVer := int64(availableVersionsBefore[0])
+		
+		// Prune in batches
+		batchSize := int64(10000)
+		totalBatches := (pruneToVersion - firstVer + batchSize - 1) / batchSize
+		fmt.Printf("  Pruning in %d batches of %d versions...\n", totalBatches, batchSize)
+		
+		batchCount := 0
+		hadError := false
+		
+		for i := firstVer; i < pruneToVersion; i += batchSize {
+			j := i + batchSize
+			if j > pruneToVersion {
+				j = pruneToVersion
+			}
+			
+			batchCount++
+			if batchCount%5 == 1 || batchCount == int(totalBatches) {
+				fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, j)
+			}
+			
+			err = mutableTree.DeleteVersionsTo(j)
+			if err != nil {
+				errMsg := err.Error()
+				if errMsg == "version does not exist" || 
+				   strings.Contains(errMsg, "is less than or equal to") {
+					continue // Skip benign errors
+				}
+				fmt.Printf("  ⚠️  Error at batch %d: %v\n", batchCount, err)
+				hadError = true
+				break
+			}
+		}
+		
+		// Check results
+		availableVersionsAfter := mutableTree.AvailableVersions()
+		deleted := len(availableVersionsBefore) - len(availableVersionsAfter)
+		
+		if hadError {
+			fmt.Printf("  ⚠️  Partial: deleted %d versions\n\n", deleted)
+			errorCount++
+			continue
+		}
+		
+		fmt.Printf("  ✓ Deleted %d versions (%d remaining)\n\n", deleted, len(availableVersionsAfter))
+		
+		successCount++
+	}
+	
+	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+	fmt.Printf("\nSummary: %d stores pruned successfully", successCount)
+	if errorCount > 0 {
+		fmt.Printf(" (%d skipped)", errorCount)
+	}
+	fmt.Printf("\n\n")
 
-	err = appStore.LoadLatestVersion()
+	// Close and reopen database for compaction
+	appDB.Close()
+	
+	appDB, err = db.NewGoLevelDBWithOpts("application", dbDir, &o)
 	if err != nil {
-		return fmt.Errorf("failed to load store: %w", err)
+		return fmt.Errorf("failed to reopen database: %w", err)
 	}
+	defer appDB.Close()
 
-	versions := appStore.GetAllVersions()
-
-	v64 := make([]int64, len(versions))
-	for i := 0; i < len(versions); i++ {
-		v64[i] = int64(versions[i])
-	}
-
-	fmt.Println(len(v64))
-
-	// Keep at least the last 10 versions, or all versions if less than 10 exist
-	if len(v64) > 10 {
-		appStore.PruneHeights = v64[:len(v64)-10]
-	} else {
-		// If we have 10 or fewer versions, don't prune any
-		appStore.PruneHeights = []int64{}
-	}
-
-	appStore.PruneStores()
-
-	fmt.Println("compacting application state")
+	fmt.Println("Compacting database (this may take several minutes)...")
 	if err := appDB.ForceCompact(nil, nil); err != nil {
-		return err
+		return fmt.Errorf("compaction failed: %w", err)
 	}
+	fmt.Println("✓ Compaction complete\n")
 
-	//create a new app store
 	return nil
 }
 
-// pruneTMData prunes the tendermint blocks and state based on the amount of blocks to keep
+// pruneTMData prunes the CometBFT blocks and state based on the amount of blocks to keep
 func pruneTMData(home string) error {
-
-	//dbDir := rootify(dataDir, home)
-
-	//o := opt.Options{
-	//	DisableSeeksCompaction: true,
-	//}
-
-	// TODO: CometBFT v0.38 API changes - needs updating
-	// The block store and state store pruning APIs have changed signatures
-	// For now, only application state pruning is supported
-	fmt.Println("Note: CometBFT block/state pruning temporarily disabled - needs API update")
-	fmt.Println("Use --cosmos-sdk=true flag for application state pruning only")
-	return fmt.Errorf("tendermint pruning not yet updated for CometBFT v0.38 APIs")
+	fmt.Println("\n=== Pruning CometBFT Data ===")
 	
-	/*
-	// Get BlockStore
-	blockStoreDB, err := db.NewGoLevelDBWithOpts("blockstore", dbDir, &o)
+	dbDir := rootify(dataDir, home)
+
+	// Get BlockStore (CometBFT uses cometbft-db)
+	blockStoreDB, err := tmdb.NewGoLevelDB("blockstore", dbDir)
 	if err != nil {
 		return err
 	}
+	defer blockStoreDB.Close()
+	
 	blockStore := tmstore.NewBlockStore(blockStoreDB)
 
-	// Get StateStore
-	stateDB, err := db.NewGoLevelDBWithOpts("state", dbDir, &o)
+	// Get StateStore (CometBFT uses cometbft-db)
+	stateDB, err := tmdb.NewGoLevelDB("state", dbDir)
 	if err != nil {
 		return err
 	}
-
-	stateStore := state.NewStore(stateDB)
+	defer stateDB.Close()
+	
+	stateStore := state.NewStore(stateDB, state.StoreOptions{})
 
 	base := blockStore.Base()
-
-	pruneHeight := blockStore.Height() - int64(blocks)
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	errs, _ := errgroup.WithContext(context.Background())
-	errs.Go(func() error {
-		fmt.Println("pruning block store")
-		// prune block store
-		blocks, err = blockStore.PruneBlocks(pruneHeight)
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("compacting block store")
-		if err := blockStoreDB.ForceCompact(nil, nil); err != nil {
-			return err
-		}
-
-		wg.Done()
+	height := blockStore.Height()
+	pruneHeight := height - int64(blocks)
+	
+	if pruneHeight <= base {
+		fmt.Printf("Nothing to prune (base: %d, height: %d, keeping: %d blocks)\n", base, height, blocks)
 		return nil
-	})
+	}
 
-	fmt.Println("pruning state store")
-	// prune state store
-	err = stateStore.PruneStates(base, pruneHeight)
+	fmt.Printf("Block range: %d - %d\n", base, height)
+	fmt.Printf("Pruning blocks up to %d (keeping last %d blocks)\n\n", pruneHeight, blocks)
+
+	// Load current state for PruneBlocks requirement
+	currentState, err := stateStore.Load()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load state: %w", err)
 	}
 
-	fmt.Println("compacting state store")
-	if err := stateDB.ForceCompact(nil, nil); err != nil {
-		return err
+	// Prune blocks
+	fmt.Println("Pruning block store...")
+	pruned, newBase, err := blockStore.PruneBlocks(pruneHeight, currentState)
+	if err != nil {
+		return fmt.Errorf("block pruning failed: %w", err)
 	}
+	fmt.Printf("  ✓ Pruned %d blocks (new base: %d)\n", pruned, newBase)
 
-	wg.Wait()
+	// Prune state (evidenceThresholdHeight = base since we're pruning everything below pruneHeight)
+	fmt.Println("Pruning state store...")
+	err = stateStore.PruneStates(base, pruneHeight, base)
+	if err != nil {
+		return fmt.Errorf("state pruning failed: %w", err)
+	}
+	fmt.Printf("  ✓ Pruned states %d to %d\n", base, pruneHeight)
 
-	stateDB.Close()
-	blockStore.Close()
+	// Note: cometbft-db v0.14 GoLevelDB doesn't expose compaction directly
+	// Compaction will happen automatically over time
+	fmt.Println("✓ CometBFT pruning complete\n")
 
 	return nil
-	*/
 }
 
 // Utils

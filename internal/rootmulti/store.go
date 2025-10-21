@@ -9,7 +9,6 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"sync"
 
 	iavltree "github.com/cosmos/iavl"
 	protoio "github.com/cosmos/gogoproto/io"
@@ -462,9 +461,10 @@ func (rs *Store) Commit() types.CommitID {
 	}
 
 	// batch prune if the current height is a pruning interval height
-	if rs.pruningOpts.Interval > 0 && version%int64(rs.pruningOpts.Interval) == 0 {
-		rs.PruneStores()
-	}
+	// Note: Disabled for offline pruning - we use explicit PruneStores(batch, height) calls instead
+	// if rs.pruningOpts.Interval > 0 && version%int64(rs.pruningOpts.Interval) == 0 {
+	// 	rs.PruneStores(10000, version)
+	// }
 
 	flushMetadata(rs.db, version, rs.lastCommitInfo, rs.PruneHeights)
 
@@ -476,45 +476,48 @@ func (rs *Store) Commit() types.CommitID {
 
 // PruneStores will batch delete a list of heights from each mounted sub-store.
 // Afterwards, pruneHeights is reset.
-func (rs *Store) PruneStores() {
-	if len(rs.PruneHeights) == 0 {
-		return
+// PruneStores prunes all IAVL stores up to pruningHeight in batches
+// Note: This method is not used in the current implementation but kept for compatibility
+func (rs *Store) PruneStores(batch int64, pruningHeight int64) error {
+	if pruningHeight <= 0 {
+		return nil
 	}
 
-	wg := sync.WaitGroup{}
-	
-	// Find the highest version to delete (prune up to this height)
-	var pruneToHeight int64
-	if len(rs.PruneHeights) > 0 {
-		pruneToHeight = rs.PruneHeights[len(rs.PruneHeights)-1]
-	} else {
-		return
-	}
-	
 	for key, store := range rs.stores {
-		wg.Add(1)
-		if store.GetStoreType() == types.StoreTypeIAVL {
-			// If the store is wrapped with an inter-block cache, we must first unwrap
-			// it to get the underlying IAVL store.
-			go func(k types.StoreKey) {
-				store = rs.GetCommitKVStore(k)
-				fmt.Println("pruning store:", k.Name())
-				if err := store.(*iavl.Store).DeleteVersionsTo(pruneToHeight); err != nil {
-					if errCause := errors.Cause(err); errCause != nil && errCause != iavltree.ErrVersionDoesNotExist {
-						fmt.Println("error pruning store:", k.Name())
-						if !strings.HasPrefix(err.Error(), "cannot delete latest saved version") {
-							panic(err)
-						}
-					}
-				}
-				fmt.Println("finished pruning store:", k.Name())
-				defer wg.Done()
-			}(key)
+		if store.GetStoreType() != types.StoreTypeIAVL {
+			continue
+		}
+
+		store = rs.GetCommitKVStore(key)
+		iavlStore := store.(*iavl.Store)
+
+		if batch == 0 {
+			batch = pruningHeight
+		}
+
+		// Prune in batches
+		for i := int64(0); i < pruningHeight; i += batch {
+			j := i + batch
+			if j > pruningHeight {
+				j = pruningHeight
+			}
+
+			err := iavlStore.DeleteVersionsTo(j)
+			if err == nil {
+				continue
+			}
+
+			if errCause := errors.Cause(err); errCause != nil && errCause == iavltree.ErrVersionDoesNotExist {
+				continue
+			}
+
+			if !strings.HasPrefix(err.Error(), "cannot delete latest saved version") {
+				return err
+			}
 		}
 	}
-	wg.Wait()
-
-	rs.PruneHeights = make([]int64, 0)
+	
+	return nil
 }
 
 func (rs *Store) GetAllVersions() []int {
