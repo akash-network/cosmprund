@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -227,36 +228,129 @@ func pruneAppState(home string) error {
 			continue
 		}
 		
-		// Prune in batches
-		batchSize := int64(10000)
-		deletionRange := actualPruneToVersion - firstVer + 1
-		totalBatches := (deletionRange + batchSize - 1) / batchSize
-		fmt.Printf("  Pruning in %d batches (deleting %d-%d)...\n", totalBatches, firstVer, actualPruneToVersion)
-		
-		batchCount := 0
 		hadError := false
+		isDeploymentStore := storeKey.Name() == "deployment"
 		
-		for currentVer := firstVer; currentVer < actualPruneToVersion; currentVer += batchSize {
-			deleteUpTo := currentVer + batchSize - 1
-			if deleteUpTo > actualPruneToVersion {
-				deleteUpTo = actualPruneToVersion
-			}
+		if isDeploymentStore {
+			// For deployment store: use manual deletion (DeleteVersionsTo doesn't work well)
+			fmt.Printf("  Manually deleting root hash keys and orphaned nodes...\n")
 			
-			batchCount++
-			if batchCount%5 == 1 || batchCount == int(totalBatches) {
-				fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, deleteUpTo)
-			}
-			
-			err = mutableTree.DeleteVersionsTo(deleteUpTo)
-			if err != nil {
-				errMsg := err.Error()
-				if errMsg == "version does not exist" || 
-				   strings.Contains(errMsg, "is less than or equal to") {
-					continue
+			prefixBytes := []byte(storePrefix)
+			iter, err := appDB.Iterator(prefixBytes, nil)
+			actualRootHashVersions := []int64{}
+			if err == nil {
+				for iter.Valid() {
+					keyBytes := iter.Key()
+					if !hasPrefix(keyBytes, prefixBytes) {
+						iter.Next()
+						continue
+					}
+					
+					suffix := keyBytes[len(prefixBytes):]
+					// Root hash keys: "r" + 8-byte big-endian version number
+					if len(suffix) >= 9 && suffix[0] == 'r' {
+						versionNum := int64(binary.BigEndian.Uint64(suffix[1:9]))
+						actualRootHashVersions = append(actualRootHashVersions, versionNum)
+					}
+					iter.Next()
 				}
-				fmt.Printf("  ⚠️  Error at batch %d: %v\n", batchCount, err)
-				hadError = true
-				break
+				iter.Close()
+			}
+			
+			batch := appDB.NewBatch()
+			deletedRootHashes := 0
+			deletedOrphanedNodes := 0
+			
+			// Delete root hash keys for versions we want to prune
+			for _, version := range actualRootHashVersions {
+				if version <= actualPruneToVersion {
+					// Build root hash key: "s/k:deployment/r" + 8-byte version
+					rootHashKey := make([]byte, len(prefixBytes)+9)
+					copy(rootHashKey, prefixBytes)
+					rootHashKey[len(prefixBytes)] = 'r'
+					binary.BigEndian.PutUint64(rootHashKey[len(prefixBytes)+1:], uint64(version))
+					
+					batch.Delete(rootHashKey)
+					deletedRootHashes++
+				}
+			}
+			
+			// Delete orphaned nodes ("o" keys) that reference old versions
+			iter2, err := appDB.Iterator(prefixBytes, nil)
+			if err == nil {
+				for iter2.Valid() {
+					keyBytes := iter2.Key()
+					if !hasPrefix(keyBytes, prefixBytes) {
+						iter2.Next()
+						continue
+					}
+					
+					suffix := keyBytes[len(prefixBytes):]
+					// Orphaned node keys: "o" + 8-byte version1 + 8-byte version2 + ...
+					if len(suffix) >= 17 && suffix[0] == 'o' {
+						// Extract the first version from the orphaned node key
+						orphanVersion1 := int64(binary.BigEndian.Uint64(suffix[1:9]))
+						
+						// If this orphaned node references a version we're pruning, delete it
+						if orphanVersion1 <= actualPruneToVersion {
+							batch.Delete(keyBytes)
+							deletedOrphanedNodes++
+						}
+					}
+					iter2.Next()
+				}
+				iter2.Close()
+			}
+			
+			// Write the batch
+			if deletedRootHashes > 0 || deletedOrphanedNodes > 0 {
+				fmt.Printf("  Deleting %d root hash keys and %d orphaned nodes...\n", deletedRootHashes, deletedOrphanedNodes)
+				err = batch.Write()
+				if err != nil {
+					fmt.Printf("  ⚠️  ERROR: Failed to write deletion batch: %v\n", err)
+					hadError = true
+				} else {
+					fmt.Printf("  ✓ Deleted %d root hash keys and %d orphaned nodes\n", deletedRootHashes, deletedOrphanedNodes)
+				}
+			} else {
+				fmt.Printf("  No keys to delete\n")
+			}
+			batch.Close()
+		} else {
+			// For other stores: use standard DeleteVersionsTo method
+			fmt.Printf("  Using DeleteVersionsTo...\n")
+			
+			// Prune in batches
+			batchSize := int64(10000)
+			deletionRange := actualPruneToVersion - firstVer + 1
+			totalBatches := (deletionRange + batchSize - 1) / batchSize
+			if totalBatches > 1 {
+				fmt.Printf("  Pruning in %d batches (deleting %d-%d)...\n", totalBatches, firstVer, actualPruneToVersion)
+			}
+			
+			batchCount := 0
+			for currentVer := firstVer; currentVer <= actualPruneToVersion; currentVer += batchSize {
+				deleteUpTo := currentVer + batchSize - 1
+				if deleteUpTo > actualPruneToVersion {
+					deleteUpTo = actualPruneToVersion
+				}
+				
+				batchCount++
+				if totalBatches > 1 && (batchCount%5 == 1 || batchCount == int(totalBatches)) {
+					fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, deleteUpTo)
+				}
+				
+				err = mutableTree.DeleteVersionsTo(deleteUpTo)
+				if err != nil {
+					errMsg := err.Error()
+					if errMsg == "version does not exist" || 
+					   strings.Contains(errMsg, "is less than or equal to") {
+						continue
+					}
+					fmt.Printf("  ⚠️  Error at batch %d: %v\n", batchCount, err)
+					hadError = true
+					break
+				}
 			}
 		}
 		
@@ -389,4 +483,8 @@ func rootify(path, root string) string {
 		return path
 	}
 	return filepath.Join(root, path)
+}
+
+func hasPrefix(s, prefix []byte) bool {
+	return len(s) >= len(prefix) && string(s[:len(prefix)]) == string(prefix)
 }
