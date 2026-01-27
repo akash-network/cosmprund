@@ -3,34 +3,34 @@ package cmd
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"cosmossdk.io/log"
 	storetypes "cosmossdk.io/store/types"
+	evidencetypes "cosmossdk.io/x/evidence/types"
+	feegrant "cosmossdk.io/x/feegrant"
+	upgradetypes "cosmossdk.io/x/upgrade/types"
+	tmdb "github.com/cometbft/cometbft-db"
 	"github.com/cometbft/cometbft/state"
 	tmstore "github.com/cometbft/cometbft/store"
-	tmdb "github.com/cometbft/cometbft-db"
-	iavltree "github.com/cosmos/iavl"
-	iavldb "github.com/cosmos/iavl/db"
+	db "github.com/cosmos/cosmos-db"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	authzkeeper "github.com/cosmos/cosmos-sdk/x/authz/keeper"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
-	paramtypes "github.com/cosmos/cosmos-sdk/x/params/types"
 	distrtypes "github.com/cosmos/cosmos-sdk/x/distribution/types"
-	evidencetypes "cosmossdk.io/x/evidence/types"
-	feegrant "cosmossdk.io/x/feegrant"
 	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
 	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
+	paramtypes "github.com/cosmos/cosmos-sdk/x/params/types"
 	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
-	upgradetypes "cosmossdk.io/x/upgrade/types"
+	iavltree "github.com/cosmos/iavl"
+	iavldb "github.com/cosmos/iavl/db"
+	gogotypes "github.com/cosmos/gogoproto/types"
 	ibctransfertypes "github.com/cosmos/ibc-go/v8/modules/apps/transfer/types"
 	"github.com/spf13/cobra"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	db "github.com/cosmos/cosmos-db"
-
-	"github.com/binaryholdings/cosmos-pruner/internal/rootmulti"
 )
 
 // load db
@@ -44,7 +44,7 @@ func pruneCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var err error
-			
+
 			// Run Tendermint pruning first (if enabled)
 			if tendermint {
 				if err = pruneTMData(args[0]); err != nil {
@@ -105,67 +105,124 @@ func pruneAppState(home string) error {
 		"cert",       // cert.StoreKey
 		"take",       // take.StoreKey
 	)
-	
 
 	// Prune each store independently using raw IAVL MutableTree
 	// This bypasses SDK wrapper limitations and enables offline pruning
-	
+
 	fmt.Println("\n=== Pruning Application Stores ===")
-	
-	latestHeight := rootmulti.GetLatestVersion(appDB)
+
+	latestHeight := getLatestVersion(appDB)
 	fmt.Printf("Latest height: %d\n", latestHeight)
-	
+
 	if latestHeight <= 0 {
 		return fmt.Errorf("database has no valid heights to prune, latest height: %d", latestHeight)
 	}
-	
+
 	// Use the --versions flag value
 	keepVersions := versions
 	if keepVersions == 0 {
 		keepVersions = 10
 	}
-	
+
 	fmt.Printf("Keeping last %d versions\n", keepVersions)
 	fmt.Printf("Processing %d stores...\n\n", len(keys))
-	
+
 	// Process each store independently
 	successCount := 0
 	errorCount := 0
-	
+
 	for _, storeKey := range keys {
 		fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 		fmt.Printf("Store: %s\n", storeKey.Name())
-		
-		// Create a new store for this specific key
-		appStore := rootmulti.NewStore(appDB)
-		appStore.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, nil)
-		
-		// Try to load this store
-		err = appStore.LoadLatestVersion()
+
+		// Use raw IAVL MutableTree directly (more reliable than SDK wrapper)
+		storePrefix := fmt.Sprintf("s/k:%s/", storeKey.Name())
+		cosmosdbPrefix := db.NewPrefixDB(appDB, []byte(storePrefix))
+		wrappedDB := iavldb.NewWrapper(cosmosdbPrefix)
+
+		logger := log.NewNopLogger()
+		mutableTree := iavltree.NewMutableTree(
+			wrappedDB,
+			1000000,
+			false,
+			logger,
+			iavltree.SyncOption(true),          // Force fsync for offline pruning
+			iavltree.AsyncPruningOption(false), // Synchronous deletion
+		)
+
+		_, err := mutableTree.Load()
 		if err != nil {
-			fmt.Printf("  ⚠️  Skipping (doesn't exist or corrupted)\n\n")
+			// Store might be fast-node-only (no root hashes) - clean cache manually
+			errMsg := err.Error()
+			if errMsg == "version does not exist" {
+				fmt.Printf("  Fast-node-only store, cleaning cache manually...\n")
+				
+				// Directly clean up old 's' keys (fast cache) based on version numbers
+				prefixBytes := []byte(storePrefix)
+				batch := appDB.NewBatch()
+				deletedCache := 0
+				
+				iter, iterErr := appDB.Iterator(prefixBytes, nil)
+				if iterErr == nil {
+					targetVersion := latestHeight - int64(keepVersions)
+					
+					for iter.Valid() {
+						keyBytes := iter.Key()
+						if !hasPrefix(keyBytes, prefixBytes) {
+							break
+						}
+						
+						suffix := keyBytes[len(prefixBytes):]
+						if len(suffix) > 0 && suffix[0] == 's' && len(suffix) >= 9 {
+							// Extract version from fast cache key
+							version := int64(binary.BigEndian.Uint64(suffix[1:9]))
+							if version < targetVersion {
+								batch.Delete(keyBytes)
+								deletedCache++
+							}
+						}
+						
+						iter.Next()
+					}
+					iter.Close()
+					
+					if deletedCache > 0 {
+						fmt.Printf("  Deleting %d old cache entries...\n", deletedCache)
+						batch.Write()
+						fmt.Printf("  ✓ Cleaned up %d cache entries\n\n", deletedCache)
+					} else {
+						fmt.Printf("  No old cache entries to clean\n\n")
+					}
+				}
+				batch.Close()
+				successCount++
+				continue
+			}
+			
+			// Other errors - skip
+			fmt.Printf("  ⚠️  Skipping (load error): %v\n\n", err)
 			errorCount++
 			continue
 		}
-		
+
 		// Get all versions BEFORE pruning
-		versionsBefore := appStore.GetAllVersions()
+		versionsBefore := mutableTree.AvailableVersions()
 		if len(versionsBefore) == 0 {
 			fmt.Printf("  No versions, skipping\n\n")
 			successCount++
 			continue
 		}
-		
+
 		firstVersion := int64(versionsBefore[0])
 		lastVersion := int64(versionsBefore[len(versionsBefore)-1])
-		
+
 		// Calculate pruning target
 		if len(versionsBefore) <= int(keepVersions) {
 			fmt.Printf("  Only %d versions, nothing to prune\n\n", len(versionsBefore))
 			successCount++
 			continue
 		}
-		
+
 		// Calculate the highest version to delete (keep last N versions)
 		pruneToVersion := lastVersion - int64(keepVersions)
 		if pruneToVersion < firstVersion {
@@ -173,178 +230,49 @@ func pruneAppState(home string) error {
 			successCount++
 			continue
 		}
-		
+
 		fmt.Printf("  Versions: %d total (range: %d-%d)\n", len(versionsBefore), firstVersion, lastVersion)
-		
-		// Safety: Don't prune stores that are too new
-		// Need at least 4x keepVersions to have meaningful pruning and safety margin
-		minVersionsForPruning := int(keepVersions) * 4
-		if len(versionsBefore) < minVersionsForPruning {
-			fmt.Printf("  Store too new (%d versions < %d threshold), skipping for safety\n\n", len(versionsBefore), minVersionsForPruning)
-			successCount++
-			continue
-		}
-		
 		fmt.Printf("  Pruning to version %d (keeping last %d)\n", pruneToVersion, keepVersions)
-		
-		// Use raw IAVL MutableTree with SyncOption(true) for offline pruning
-		storePrefix := fmt.Sprintf("s/k:%s/", storeKey.Name())
-		cosmosdbPrefix := db.NewPrefixDB(appDB, []byte(storePrefix))
-		wrappedDB := iavldb.NewWrapper(cosmosdbPrefix)
-		
-		logger := log.NewNopLogger()
-		mutableTree := iavltree.NewMutableTree(
-			wrappedDB, 
-			1000000, 
-			false, 
-			logger,
-			iavltree.SyncOption(true),           // Force fsync for offline pruning
-			iavltree.AsyncPruningOption(false),  // Synchronous deletion
-		)
-		
-		_, err := mutableTree.Load()
-		if err != nil {
-			fmt.Printf("  ⚠️  ERROR: %v\n\n", err)
-			errorCount++
-			continue
-		}
-		
-		availableVersionsBefore := mutableTree.AvailableVersions()
-		if len(availableVersionsBefore) == 0 {
-			fmt.Printf("  No versions\n\n")
-			successCount++
-			continue
-		}
-		
-		firstVer := int64(availableVersionsBefore[0])
-		
-		// CRITICAL FIX: Only delete versions that actually exist in this store!
-		// Don't try to delete versions before firstVer
+
+		// CRITICAL: Only delete versions that actually exist in this store!
+		// Don't try to delete versions before firstVersion
 		actualPruneToVersion := pruneToVersion
-		if actualPruneToVersion < firstVer {
-			// This store doesn't have versions that old
-			fmt.Printf("  Store only has versions from %d onwards, nothing to prune\n\n", firstVer)
-			successCount++
-			continue
+		if actualPruneToVersion < firstVersion {
+			actualPruneToVersion = firstVersion - 1 // Nothing to prune
 		}
-		
+
 		hadError := false
-		isDeploymentStore := storeKey.Name() == "deployment"
-		
-		if isDeploymentStore {
-			// For deployment store: use manual deletion (DeleteVersionsTo doesn't work well)
-			fmt.Printf("  Manually deleting root hash keys and orphaned nodes...\n")
-			
-			prefixBytes := []byte(storePrefix)
-			iter, err := appDB.Iterator(prefixBytes, nil)
-			actualRootHashVersions := []int64{}
-			if err == nil {
-				for iter.Valid() {
-					keyBytes := iter.Key()
-					if !hasPrefix(keyBytes, prefixBytes) {
-						iter.Next()
-						continue
-					}
-					
-					suffix := keyBytes[len(prefixBytes):]
-					// Root hash keys: "r" + 8-byte big-endian version number
-					if len(suffix) >= 9 && suffix[0] == 'r' {
-						versionNum := int64(binary.BigEndian.Uint64(suffix[1:9]))
-						actualRootHashVersions = append(actualRootHashVersions, versionNum)
-					}
-					iter.Next()
-				}
-				iter.Close()
-			}
-			
-			batch := appDB.NewBatch()
-			deletedRootHashes := 0
-			deletedOrphanedNodes := 0
-			
-			// Delete root hash keys for versions we want to prune
-			for _, version := range actualRootHashVersions {
-				if version <= actualPruneToVersion {
-					// Build root hash key: "s/k:deployment/r" + 8-byte version
-					rootHashKey := make([]byte, len(prefixBytes)+9)
-					copy(rootHashKey, prefixBytes)
-					rootHashKey[len(prefixBytes)] = 'r'
-					binary.BigEndian.PutUint64(rootHashKey[len(prefixBytes)+1:], uint64(version))
-					
-					batch.Delete(rootHashKey)
-					deletedRootHashes++
-				}
-			}
-			
-			// Delete orphaned nodes ("o" keys) that reference old versions
-			iter2, err := appDB.Iterator(prefixBytes, nil)
-			if err == nil {
-				for iter2.Valid() {
-					keyBytes := iter2.Key()
-					if !hasPrefix(keyBytes, prefixBytes) {
-						iter2.Next()
-						continue
-					}
-					
-					suffix := keyBytes[len(prefixBytes):]
-					// Orphaned node keys: "o" + 8-byte version1 + 8-byte version2 + ...
-					if len(suffix) >= 17 && suffix[0] == 'o' {
-						// Extract the first version from the orphaned node key
-						orphanVersion1 := int64(binary.BigEndian.Uint64(suffix[1:9]))
-						
-						// If this orphaned node references a version we're pruning, delete it
-						if orphanVersion1 <= actualPruneToVersion {
-							batch.Delete(keyBytes)
-							deletedOrphanedNodes++
-						}
-					}
-					iter2.Next()
-				}
-				iter2.Close()
-			}
-			
-			// Write the batch
-			if deletedRootHashes > 0 || deletedOrphanedNodes > 0 {
-				fmt.Printf("  Deleting %d root hash keys and %d orphaned nodes...\n", deletedRootHashes, deletedOrphanedNodes)
-				err = batch.Write()
-				if err != nil {
-					fmt.Printf("  ⚠️  ERROR: Failed to write deletion batch: %v\n", err)
-					hadError = true
-				} else {
-					fmt.Printf("  ✓ Deleted %d root hash keys and %d orphaned nodes\n", deletedRootHashes, deletedOrphanedNodes)
-				}
-			} else {
-				fmt.Printf("  No keys to delete\n")
-			}
-			batch.Close()
-		} else {
-			// For other stores: use standard DeleteVersionsTo method
+
+		// Prune versions
+		if actualPruneToVersion >= firstVersion {
+			// Use standard DeleteVersionsTo method for all stores
 			fmt.Printf("  Using DeleteVersionsTo...\n")
-			
+
 			// Prune in batches
 			batchSize := int64(10000)
-			deletionRange := actualPruneToVersion - firstVer + 1
+			deletionRange := actualPruneToVersion - firstVersion + 1
 			totalBatches := (deletionRange + batchSize - 1) / batchSize
 			if totalBatches > 1 {
-				fmt.Printf("  Pruning in %d batches (deleting %d-%d)...\n", totalBatches, firstVer, actualPruneToVersion)
+				fmt.Printf("  Pruning in %d batches (deleting %d-%d)...\n", totalBatches, firstVersion, actualPruneToVersion)
 			}
-			
+
 			batchCount := 0
-			for currentVer := firstVer; currentVer <= actualPruneToVersion; currentVer += batchSize {
+			for currentVer := firstVersion; currentVer <= actualPruneToVersion; currentVer += batchSize {
 				deleteUpTo := currentVer + batchSize - 1
 				if deleteUpTo > actualPruneToVersion {
 					deleteUpTo = actualPruneToVersion
 				}
-				
+
 				batchCount++
 				if totalBatches > 1 && (batchCount%5 == 1 || batchCount == int(totalBatches)) {
 					fmt.Printf("  Progress: batch %d/%d (deleting to version %d)...\n", batchCount, totalBatches, deleteUpTo)
 				}
-				
+
 				err = mutableTree.DeleteVersionsTo(deleteUpTo)
 				if err != nil {
 					errMsg := err.Error()
-					if errMsg == "version does not exist" || 
-					   strings.Contains(errMsg, "is less than or equal to") {
+					if errMsg == "version does not exist" ||
+						strings.Contains(errMsg, "is less than or equal to") {
 						continue
 					}
 					fmt.Printf("  ⚠️  Error at batch %d: %v\n", batchCount, err)
@@ -353,19 +281,99 @@ func pruneAppState(home string) error {
 				}
 			}
 		}
-		
+
+		// CRITICAL: Clean up orphaned fast node cache entries
+		// These "s" keys accumulate and can take up 50%+ of database size
+		if !hadError {
+			fmt.Printf("  Cleaning up orphaned fast node cache...\n")
+
+			prefixBytes := []byte(storePrefix)
+			batch := appDB.NewBatch()
+			deletedFastCache := 0
+			deletedOrphans := 0
+
+			// Get remaining versions after pruning
+			remainingVersions := mutableTree.AvailableVersions()
+			remainingVersionMap := make(map[int]bool)
+			for _, v := range remainingVersions {
+				remainingVersionMap[v] = true
+			}
+
+			iter, err := appDB.Iterator(prefixBytes, nil)
+			if err == nil {
+				for iter.Valid() {
+					keyBytes := iter.Key()
+					if !hasPrefix(keyBytes, prefixBytes) {
+						break
+					}
+
+					suffix := keyBytes[len(prefixBytes):]
+					if len(suffix) > 0 {
+						shouldDelete := false
+
+						// Check for orphaned fast node cache ("s" keys)
+						if suffix[0] == 's' && len(suffix) >= 9 {
+							// Extract version from fast cache key: "s" + 8 bytes version + ...
+							version := int(binary.BigEndian.Uint64(suffix[1:9]))
+							if !remainingVersionMap[version] {
+								shouldDelete = true
+								deletedFastCache++
+							}
+						}
+
+						// Check for orphaned nodes ("o" keys)
+						if suffix[0] == 'o' && len(suffix) >= 9 {
+							version := int(binary.BigEndian.Uint64(suffix[1:9]))
+							if !remainingVersionMap[version] {
+								shouldDelete = true
+								deletedOrphans++
+							}
+						}
+
+						// Check for orphaned root hashes ("r" keys)
+						if suffix[0] == 'r' && len(suffix) >= 9 {
+							version := int(binary.BigEndian.Uint64(suffix[1:9]))
+							if !remainingVersionMap[version] {
+								shouldDelete = true
+							}
+						}
+
+						if shouldDelete {
+							batch.Delete(keyBytes)
+						}
+					}
+
+					iter.Next()
+				}
+				iter.Close()
+
+				// Write the batch
+				if deletedFastCache > 0 || deletedOrphans > 0 {
+					fmt.Printf("  Deleting %d fast cache entries and %d orphaned nodes...\n", deletedFastCache, deletedOrphans)
+					err = batch.Write()
+					if err != nil {
+						fmt.Printf("  ⚠️  ERROR: Failed to write cleanup batch: %v\n", err)
+						hadError = true
+					} else {
+						fmt.Printf("  ✓ Cleaned up %d fast cache entries and %d orphaned nodes\n", deletedFastCache, deletedOrphans)
+					}
+				}
+			}
+			batch.Close()
+		}
+
 		// Check results
-		availableVersionsAfter := mutableTree.AvailableVersions()
-		countBefore := len(availableVersionsBefore)
-		countAfter := len(availableVersionsAfter)
+		versionsAfter := mutableTree.AvailableVersions()
+		countBefore := len(versionsBefore)
+		countAfter := len(versionsAfter)
 		deleted := countBefore - countAfter
-		
+
 		if hadError {
 			fmt.Printf("  ⚠️  Partial: deleted %d of %d versions (%d remaining)\n\n", deleted, countBefore, countAfter)
 			errorCount++
 			continue
 		}
-		
+
 		if deleted > 0 {
 			fmt.Printf("  ✓ Deleted %d versions (%d remaining)\n\n", deleted, countAfter)
 		} else if deleted == 0 {
@@ -374,18 +382,18 @@ func pruneAppState(home string) error {
 			// Unexpected increase - show diagnostics
 			fmt.Printf("  ⚠️  Unexpected: version count increased (was %d, now %d)\n", countBefore, countAfter)
 			if countAfter > 0 && countAfter < 10 {
-				fmt.Printf("  After array: %v\n", availableVersionsAfter)
+				fmt.Printf("  After array: %v\n", versionsAfter)
 			} else if countAfter > 0 {
-				fmt.Printf("  After range: %d - %d\n", availableVersionsAfter[0], availableVersionsAfter[countAfter-1])
+				fmt.Printf("  After range: %d - %d\n", versionsAfter[0], versionsAfter[countAfter-1])
 			}
 			fmt.Printf("  WARNING: This store may be corrupted, skipping\n\n")
 			errorCount++
 			continue
 		}
-		
+
 		successCount++
 	}
-	
+
 	fmt.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 	fmt.Printf("\nSummary: %d stores pruned successfully", successCount)
 	if errorCount > 0 {
@@ -393,20 +401,107 @@ func pruneAppState(home string) error {
 	}
 	fmt.Printf("\n\n")
 
+	// Clean up old commit info metadata
+	fmt.Println("\n=== Cleaning Up Commit Info Metadata ===")
+
+	// Find all commit info keys (s/<version>)
+	metadataPrefix := []byte("s/")
+	iter, err := appDB.Iterator(metadataPrefix, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create metadata iterator: %w", err)
+	}
+
+	oldCommitInfoVersions := []int64{}
+	for iter.Valid() {
+		keyBytes := iter.Key()
+		keyStr := string(keyBytes)
+
+		// Skip if it's not our prefix
+		if !strings.HasPrefix(keyStr, "s/") {
+			break
+		}
+
+		// Skip store keys, latest, pruneheights
+		if strings.HasPrefix(keyStr, "s/k:") || keyStr == "s/latest" || keyStr == "s/pruneheights" {
+			iter.Next()
+			continue
+		}
+
+		// Try to parse as a version number (s/<version>)
+		var version int64
+		_, err := fmt.Sscanf(keyStr[2:], "%d", &version)
+		if err == nil {
+			// Check if this version is older than what we're keeping
+			targetVersion := latestHeight - int64(keepVersions)
+			if version < targetVersion {
+				oldCommitInfoVersions = append(oldCommitInfoVersions, version)
+			}
+		}
+
+		iter.Next()
+	}
+	iter.Close()
+
+	// Delete old commit info entries in batches
+	if len(oldCommitInfoVersions) > 0 {
+		fmt.Printf("Found %d old commit info entries to delete\n", len(oldCommitInfoVersions))
+		fmt.Printf("Deleting commit info for versions < %d...\n", latestHeight-int64(keepVersions))
+
+		batch := appDB.NewBatch()
+		batchCount := 0
+		totalDeleted := 0
+
+		for _, version := range oldCommitInfoVersions {
+			commitKey := fmt.Sprintf("s/%d", version)
+			batch.Delete([]byte(commitKey))
+			batchCount++
+			totalDeleted++
+
+			// Write batch every 10000 entries
+			if batchCount >= 10000 {
+				err = batch.Write()
+				if err != nil {
+					fmt.Printf("  ⚠️  ERROR writing batch: %v\n", err)
+				} else {
+					if totalDeleted%100000 == 0 {
+						fmt.Printf("  Deleted %d commit info entries...\n", totalDeleted)
+					}
+				}
+				batch.Close()
+				batch = appDB.NewBatch()
+				batchCount = 0
+			}
+		}
+
+		// Write remaining
+		if batchCount > 0 {
+			err = batch.Write()
+			if err != nil {
+				fmt.Printf("  ⚠️  ERROR writing final batch: %v\n", err)
+			}
+			batch.Close()
+		}
+
+		fmt.Printf("✓ Deleted %d old commit info entries\n", totalDeleted)
+	} else {
+		fmt.Println("No old commit info entries to delete")
+	}
+
 	// Close and reopen database for compaction
 	appDB.Close()
-	
+
 	appDB, err = db.NewGoLevelDBWithOpts("application", dbDir, &o)
 	if err != nil {
 		return fmt.Errorf("failed to reopen database: %w", err)
 	}
 	defer appDB.Close()
 
-	fmt.Println("Compacting database (this may take several minutes)...")
+	fmt.Println("\nCompacting database (this may take several minutes)...")
 	if err := appDB.ForceCompact(nil, nil); err != nil {
 		return fmt.Errorf("compaction failed: %w", err)
 	}
-	fmt.Println("✓ Compaction complete\n")
+	fmt.Println("✓ Compaction complete")
+	fmt.Println()
 
 	return nil
 }
@@ -414,7 +509,7 @@ func pruneAppState(home string) error {
 // pruneTMData prunes the CometBFT blocks and state based on the amount of blocks to keep
 func pruneTMData(home string) error {
 	fmt.Println("\n=== Pruning CometBFT Data ===")
-	
+
 	dbDir := rootify(dataDir, home)
 
 	// Get BlockStore (CometBFT uses cometbft-db)
@@ -423,7 +518,7 @@ func pruneTMData(home string) error {
 		return err
 	}
 	defer blockStoreDB.Close()
-	
+
 	blockStore := tmstore.NewBlockStore(blockStoreDB)
 
 	// Get StateStore (CometBFT uses cometbft-db)
@@ -432,46 +527,142 @@ func pruneTMData(home string) error {
 		return err
 	}
 	defer stateDB.Close()
-	
+
 	stateStore := state.NewStore(stateDB, state.StoreOptions{})
 
 	base := blockStore.Base()
 	height := blockStore.Height()
 	pruneHeight := height - int64(blocks)
 	
-	if pruneHeight <= base {
-		fmt.Printf("Nothing to prune (base: %d, height: %d, keeping: %d blocks)\n", base, height, blocks)
-		return nil
+	fmt.Printf("Block range: %d - %d (total: %d blocks)\n", base, height, height-base+1)
+
+	needsPruning := pruneHeight > base
+	if needsPruning {
+		fmt.Printf("Pruning blocks up to %d (keeping last %d blocks)\n\n", pruneHeight, blocks)
+	} else {
+		fmt.Printf("Blocks already pruned to %d blocks, skipping pruning\n\n", blocks)
 	}
 
-	fmt.Printf("Block range: %d - %d\n", base, height)
-	fmt.Printf("Pruning blocks up to %d (keeping last %d blocks)\n\n", pruneHeight, blocks)
+	var newBase int64
+	
+	if needsPruning {
+		// Load current state for PruneBlocks requirement
+		currentState, err := stateStore.Load()
+		if err != nil {
+			return fmt.Errorf("failed to load state: %w", err)
+		}
 
-	// Load current state for PruneBlocks requirement
-	currentState, err := stateStore.Load()
-	if err != nil {
-		return fmt.Errorf("failed to load state: %w", err)
+		// Prune blocks
+		fmt.Println("Pruning block store...")
+		pruned, nb, err := blockStore.PruneBlocks(pruneHeight, currentState)
+		if err != nil {
+			return fmt.Errorf("block pruning failed: %w", err)
+		}
+		newBase = nb
+		fmt.Printf("  ✓ Pruned %d blocks (new base: %d)\n", pruned, newBase)
+
+		// Prune state (evidenceThresholdHeight = base since we're pruning everything below pruneHeight)
+		fmt.Println("Pruning state store...")
+		err = stateStore.PruneStates(base, pruneHeight, base)
+		if err != nil {
+			return fmt.Errorf("state pruning failed: %w", err)
+		}
+		fmt.Printf("  ✓ Pruned states %d to %d\n", base, pruneHeight)
+	} else {
+		newBase = base
 	}
 
-	// Prune blocks
-	fmt.Println("Pruning block store...")
-	pruned, newBase, err := blockStore.PruneBlocks(pruneHeight, currentState)
-	if err != nil {
-		return fmt.Errorf("block pruning failed: %w", err)
+	// CRITICAL: Clean up orphaned blockstore entries
+	// PruneBlocks() only updates base/height but doesn't delete C:/H: keys
+	fmt.Println("\nCleaning up orphaned blockstore entries...")
+	
+	// The valid height range is newBase to height
+	fmt.Printf("  Valid height range: %d to %d\n", newBase, height)
+	
+	batch := blockStoreDB.NewBatch()
+	deletedCount := 0
+	keptCount := 0
+	checkedCount := 0
+	
+	// Clean up all keys with height outside our range
+	iter, err := blockStoreDB.Iterator(nil, nil)
+	if err == nil {
+		for iter.Valid() {
+			key := iter.Key()
+			keyStr := string(key)
+			
+			// Parse height from C: and H: keys (heights are ASCII strings!)
+			shouldDelete := false
+			if len(keyStr) >= 3 && (keyStr[:2] == "C:" || keyStr[:2] == "H:") {
+				// Height is encoded as ASCII decimal string after prefix
+				var blockHeight int64
+				_, err := fmt.Sscanf(keyStr[2:], "%d", &blockHeight)
+				if err == nil {
+					// Delete if height is outside our keep range
+					if blockHeight < newBase || blockHeight > height {
+						shouldDelete = true
+					}
+				}
+			}
+			
+			if shouldDelete {
+				batch.Delete(key)
+				deletedCount++
+			} else {
+				keptCount++
+			}
+			
+			checkedCount++
+			if checkedCount%100000 == 0 {
+				fmt.Printf("\r  Checked %d entries: keeping %d, deleting %d...", checkedCount, keptCount, deletedCount)
+			}
+			
+			// Write batch periodically
+			if deletedCount > 0 && deletedCount%50000 == 0 {
+				err := batch.Write()
+				if err != nil {
+					fmt.Printf("\nError writing batch: %v\n", err)
+				}
+				batch.Close()
+				batch = blockStoreDB.NewBatch()
+			}
+			
+			iter.Next()
+		}
+		iter.Close()
+		
+		// Write final batch
+		if deletedCount > 0 {
+			err := batch.Write()
+			if err != nil {
+				fmt.Printf("\nError writing final batch: %v\n", err)
+			}
+		}
+		batch.Close()
+		
+		fmt.Printf("\r  ✓ Deleted %d orphaned entries (kept %d valid)\n", deletedCount, keptCount)
 	}
-	fmt.Printf("  ✓ Pruned %d blocks (new base: %d)\n", pruned, newBase)
 
-	// Prune state (evidenceThresholdHeight = base since we're pruning everything below pruneHeight)
-	fmt.Println("Pruning state store...")
-	err = stateStore.PruneStates(base, pruneHeight, base)
-	if err != nil {
-		return fmt.Errorf("state pruning failed: %w", err)
+	// Auto-compact databases to reclaim space
+	fmt.Println("\nCompacting blockstore database...")
+	blockStoreDB.Close()
+	if err := compactTmDB("blockstore", dbDir); err != nil {
+		fmt.Printf("  ⚠️  Compaction failed: %v\n", err)
+	} else {
+		fmt.Println("  ✓ Blockstore compacted")
 	}
-	fmt.Printf("  ✓ Pruned states %d to %d\n", base, pruneHeight)
-
-	// Note: cometbft-db v0.14 GoLevelDB doesn't expose compaction directly
-	// Compaction will happen automatically over time
-	fmt.Println("✓ CometBFT pruning complete\n")
+	
+	fmt.Println("Compacting state database...")
+	stateDB.Close()
+	if err := compactTmDB("state", dbDir); err != nil {
+		fmt.Printf("  ⚠️  Compaction failed: %v\n", err)
+	} else {
+		fmt.Println("  ✓ State compacted")
+	}
+	
+	fmt.Println()
+	fmt.Println("✓ CometBFT pruning and compaction complete")
+	fmt.Println()
 
 	return nil
 }
@@ -487,4 +678,87 @@ func rootify(path, root string) string {
 
 func hasPrefix(s, prefix []byte) bool {
 	return len(s) >= len(prefix) && string(s[:len(prefix)]) == string(prefix)
+}
+
+func getLatestVersion(db db.DB) int64 {
+	bz, err := db.Get([]byte("s/latest"))
+	if err != nil {
+		panic(err)
+	} else if bz == nil {
+		return 0
+	}
+
+	var latestVersion int64
+	if err := gogotypes.StdInt64Unmarshal(&latestVersion, bz); err != nil {
+		panic(err)
+	}
+
+	return latestVersion
+}
+
+func compactTmDB(name, dir string) error {
+	// Open source database
+	dbOld, err := tmdb.NewGoLevelDB(name, dir)
+	if err != nil {
+		return err
+	}
+	
+	// Get all keys and values
+	iter, err := dbOld.Iterator(nil, nil)
+	if err != nil {
+		dbOld.Close()
+		return err
+	}
+	
+	type kv struct {
+		key   []byte
+		value []byte
+	}
+	var entries []kv
+	
+	for iter.Valid() {
+		key := make([]byte, len(iter.Key()))
+		value := make([]byte, len(iter.Value()))
+		copy(key, iter.Key())
+		copy(value, iter.Value())
+		entries = append(entries, kv{key, value})
+		iter.Next()
+	}
+	iter.Close()
+	dbOld.Close()
+	
+	// Delete old database directory
+	dbPath := filepath.Join(dir, name+".db")
+	if err := os.RemoveAll(dbPath); err != nil {
+		return fmt.Errorf("failed to remove old db: %w", err)
+	}
+	
+	// Create new database with fresh files
+	dbNew, err := tmdb.NewGoLevelDB(name, dir)
+	if err != nil {
+		return err
+	}
+	defer dbNew.Close()
+	
+	// Write all entries in batches
+	batch := dbNew.NewBatch()
+	for i, entry := range entries {
+		batch.Set(entry.key, entry.value)
+		
+		if (i+1)%10000 == 0 {
+			if err := batch.Write(); err != nil {
+				return err
+			}
+			batch.Close()
+			batch = dbNew.NewBatch()
+		}
+	}
+	
+	// Write remaining
+	if err := batch.Write(); err != nil {
+		return err
+	}
+	batch.Close()
+	
+	return nil
 }
